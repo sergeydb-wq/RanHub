@@ -358,13 +358,21 @@ end
 
 local function BuildTextbox(parent, o)
     local obj = { Value = "" }
+    local flag = o.Flag or o.Name
     local row = New("Frame", { Size = UDim2.new(1, 0, 0, 34), BackgroundTransparency = 1, Parent = parent })
     local box = New("TextBox", { Position = UDim2.fromOffset(12, 3), Size = UDim2.new(1, -24, 0, 28),
         BackgroundColor3 = Theme.Field, Text = "", PlaceholderText = o.Placeholder or o.Name,
         PlaceholderColor3 = Theme.SubText, Font = Enum.Font.GothamMedium, TextSize = 13,
         TextColor3 = Theme.Text, ClearTextOnFocus = false, Parent = row }, { Corner(6), Pad(8, 0, 8, 0) })
-    box.FocusLost:Connect(function() obj.Value = box.Text; if o.Callback then task.spawn(o.Callback, box.Text) end end)
-    function obj:Set(t) box.Text = t; obj.Value = t end
+    local function commit(t, silent)
+        obj.Value = t
+        if not o.NoFlag then Library.Flags[flag] = t end
+        if not silent and o.Callback then task.spawn(o.Callback, t) end
+    end
+    box.FocusLost:Connect(function() commit(box.Text) end)
+    function obj:Set(t, silent) t = tostring(t or ""); box.Text = t; commit(t, silent) end
+    if not o.NoFlag then Library.Setters[flag] = function(v) obj:Set(v) end end
+    if o.Default then obj:Set(o.Default, true) end
     return obj
 end
 
@@ -781,6 +789,7 @@ Library:CreateWatermark()
 
 local Combat  = Window:AddTab("Бой",      Library.Icon("icon_fight.png")     or "⚔")
 local Movement = Window:AddTab("Движение", Library.Icon("icon_movement.png") or "➤")
+local FarmTab  = Window:AddTab("Фарм",     Library.Icon("icon_farm.png")      or "⛏")
 local Visuals = Window:AddTab("Визуалы", Library.Icon("icon_visuals.png") or "👁")
 Window:AddConfigTab("Конфиги",     Library.Icon("icon_configs.png")  or "📁")
 Window:AddSettingsTab("Настройки", Library.Icon("icon_settings.png") or "⚙")
@@ -800,8 +809,9 @@ local OreConfig = {
         GoldOre    = { Label = "Золото", Enabled = true, Color = Color3.fromRGB(255, 215, 0) },
         RubyOre    = { Label = "Рубин",  Enabled = true, Color = Color3.fromRGB(255, 0, 60) },
         SteelOre   = { Label = "Железо", Enabled = true, Color = Color3.fromRGB(200, 200, 200) },
+        SapphireOre = { Label = "Сапфир", Enabled = true, Color = Color3.fromRGB(40, 110, 255), WholeMap = true },  -- сапфир: по умолчанию видно на всей карте
     },
-    Order = { "CoalOre", "DiamondOre", "GoldOre", "RubyOre", "SteelOre" },
+    Order = { "CoalOre", "DiamondOre", "GoldOre", "RubyOre", "SteelOre", "SapphireOre" },
 }
 
 local Blocks = workspace:WaitForChild("Blocks")
@@ -879,7 +889,8 @@ table.insert(conns, RunService.Heartbeat:Connect(function()
 
     for obj, a in pairs(adornments) do
         local part = a.Adornee
-        if not OreConfig.LimitDistance or not origin or not part then
+        local oc = OreConfig.Ores[obj.Name]
+        if not OreConfig.LimitDistance or (oc and oc.WholeMap) or not origin or not part then
             a.Visible = true
         else
             a.Visible = (part.Position - origin).Magnitude <= OreConfig.MaxDistance
@@ -955,6 +966,8 @@ for _, oreName in ipairs(OreConfig.Order) do
         Callback = function(v) rgb.g = v; applyColor() end })
     m:AddSlider({ Name = "B", Min = 0, Max = 255, Default = rgb.b, Increment = 1,
         Callback = function(v) rgb.b = v; applyColor() end })
+    m:AddToggle({ Name = "Вся карта (без лимита дальности)", Default = s.WholeMap or false,
+        Callback = function(v) s.WholeMap = v end })
 end
 
 
@@ -1674,4 +1687,408 @@ do
     m:AddSlider({ Name = "Угол сверху", Min = 10, Max = 89, Default = TP.Angle, Increment = 1, Suffix = "°",
         Callback = function(v) TP.Angle = v end })
     m:AddKeybind({ Name = "Бинд" })
+end
+
+--// ═══════════════════════════════════════════════════════════════════
+--// NO SUFFOCATION — блокируем отправку урона от удушья (GameRemotes.Demo)
+--// ═══════════════════════════════════════════════════════════════════
+local Guard = { Suffocation = false, Force = false }
+
+do
+    local ok = pcall(function()
+        assert(hookmetamethod and getnamecallmethod, "no hookmetamethod")
+        local wrap = newcclosure or function(f) return f end
+        local old
+        old = hookmetamethod(game, "__namecall", wrap(function(self, ...)
+            if (Guard.Suffocation or Guard.Force) and getnamecallmethod() == "FireServer" then
+                local args = { ... }
+                if args[2] == "suffocation" and typeof(self) == "Instance" and self.Name == "Demo" then
+                    return  -- урон от удушья не отправляется
+                end
+            end
+            return old(self, ...)
+        end))
+    end)
+    if not ok then print("[NurLib] hookmetamethod недоступен в этом экзекуторе: No Suffocation работать не будет") end
+end
+
+--// ═══════════════════════════════════════════════════════════════════
+--// ORE FARM + WEBHOOK-ОТЧЁТЫ (вкладка "Фарм")
+--// ═══════════════════════════════════════════════════════════════════
+do
+    local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+    local FARM_OFFSET  = Vector3.new(0, BLOCK_SIZE, 0)  -- ◄◄ где стоять относительно руды (над ней)
+    -- Ломание блока: BreakBlock:FireServer(x, y, z, nil) -> AcceptBreakBlock:InvokeServer(); отмена: CancelBlock
+    -- x, y, z — координаты блока в сетке (мировая позиция / BLOCK_SIZE, округлено).
+    -- ◄◄ Если блоки не ломаются: включи Debug, сравни выведенные x,y,z с Cobalt для того же блока и поправь BLOCK_SIZE / GRID_OFFSET.
+    local GRID_OFFSET = Vector3.new(0, 0, 0)  -- ◄◄ сдвиг сетки, если координаты не совпадают
+
+    local ICONS = { CoalOre = "⚫", DiamondOre = "💎", GoldOre = "🟡", RubyOre = "🔴", SteelOre = "⚪", SapphireOre = "🔵" }
+
+    local Farm = {
+        Enabled = false,
+        Ores = { DiamondOre = true, GoldOre = true, RubyOre = true, SapphireOre = true },
+        CPS = 8, AcceptDelay = 0.2, Timeout = 8, HpLow = 40, HpFull = 90, PickSlot = 0, FoodSlot = 2, Debug = false,
+    }
+    local Web = { Url = "", Send = true, Interval = 60 }
+
+    local session, allTime, pending = {}, {}, {}
+    local skip = setmetatable({}, { __mode = "k" })
+    local token = 0
+    local farmModule
+    local lastFlush = os.clock()
+
+    --// ───────────── статистика (blockcraft/farm_stats.json) ─────────────
+    local STATS_FILE = SAVE_DIR .. "/farm_stats.json"
+    local function loadStats()
+        if not fsOK() then return end
+        pcall(function()
+            if isfile(STATS_FILE) then
+                for k, v in pairs(HttpService:JSONDecode(readfile(STATS_FILE))) do allTime[k] = tonumber(v) or 0 end
+            end
+        end)
+    end
+    local function saveStats()
+        if not fsOK() then return end
+        pcall(function()
+            if not isfolder(SAVE_DIR) then makefolder(SAVE_DIR) end
+            writefile(STATS_FILE, HttpService:JSONEncode(allTime))
+        end)
+    end
+    loadStats()
+
+    local function record(name)
+        session[name] = (session[name] or 0) + 1
+        allTime[name] = (allTime[name] or 0) + 1
+        pending[name] = (pending[name] or 0) + 1
+    end
+
+    --// ───────────── вебхук ─────────────
+    local function labelOf(k)
+        local o = OreConfig.Ores[k]
+        return o and o.Label or k
+    end
+    local function lines(tbl)
+        local keys = {}
+        for k in pairs(tbl) do table.insert(keys, k) end
+        table.sort(keys)
+        local out = {}
+        for _, k in ipairs(keys) do
+            table.insert(out, string.format("%s %s ×%d", ICONS[k] or "▪️", labelOf(k), tbl[k]))
+        end
+        return #out > 0 and table.concat(out, "\n") or "—"
+    end
+
+    local function buildEmbed(title, period, desc)
+        return {
+            title = title,
+            description = desc,
+            color = 16416882,
+            fields = {
+                { name = "⛏️ Добыто за период", value = lines(period), inline = false },
+                { name = "📦 За сессию",        value = lines(session), inline = true },
+                { name = "🏆 Всего",            value = lines(allTime), inline = true },
+            },
+            footer = { text = "NurLib • " .. LocalPlayer.Name },
+            timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+        }
+    end
+
+    local function validUrl(u)
+        return u:match("^https://discord%.com/api/webhooks/") or u:match("^https://discordapp%.com/api/webhooks/")
+            or u:match("^https://ptb%.discord%.com/api/webhooks/") or u:match("^https://canary%.discord%.com/api/webhooks/")
+    end
+
+    local function post(embed, silent)
+        local url = (Web.Url or ""):gsub("%s", "")
+        if url == "" then
+            if not silent then Library:Notify("Вставь ссылку вебхука", 3) end
+            return false
+        end
+        if not validUrl(url) then
+            if not silent then Library:Notify("Это не ссылка Discord-вебхука", 3) end
+            return false
+        end
+        local req = request or http_request or (syn and syn.request)
+        if not req then
+            if not silent then Library:Notify("Экзекутор не поддерживает request", 3) end
+            return false
+        end
+        local ok, res = pcall(req, {
+            Url = url, Method = "POST",
+            Headers = { ["Content-Type"] = "application/json" },
+            Body = HttpService:JSONEncode({ embeds = { embed } }),
+        })
+        local code = ok and type(res) == "table" and res.StatusCode
+        if not (code and code >= 200 and code < 300) then
+            local body = (ok and type(res) == "table" and res.Body) or tostring(res)
+            if Farm.Debug then print("[Webhook] ошибка", code, body) end
+            if not silent then
+                if tostring(body):find("thread") then
+                    Library:Notify("Форум-канал: добавь ?thread_id=ID к ссылке вебхука", 5)
+                else
+                    Library:Notify("Вебхук: ошибка " .. tostring(code or "запроса"), 4)
+                end
+            end
+            return false
+        end
+        return true
+    end
+
+    local function flush()
+        local total = 0
+        for _, n in pairs(pending) do total += n end
+        lastFlush = os.clock()
+        if total == 0 then return end
+        saveStats()
+        if not Web.Send then pending = {} return end
+        local snap = pending
+        pending = {}
+        task.spawn(function()
+            if not post(buildEmbed("⛏️ Ore Farm", snap), true) then
+                for k, n in pairs(snap) do pending[k] = (pending[k] or 0) + n end  -- вернуть, отправим позже
+            end
+        end)
+    end
+
+    table.insert(conns, RunService.Heartbeat:Connect(function()
+        if Web.Send and os.clock() - lastFlush >= Web.Interval then flush() end
+    end))
+
+    --// ───────────── игровые действия ─────────────
+    local function remote(name)
+        local gr = ReplicatedStorage:FindFirstChild("GameRemotes")
+        return gr and gr:FindFirstChild(name)
+    end
+    local function myRoot()
+        local c = LocalPlayer.Character
+        return c and c:FindFirstChild("HumanoidRootPart")
+    end
+    local function hpPercent()
+        local c = LocalPlayer.Character
+        local h = c and c:FindFirstChildOfClass("Humanoid")
+        if not h or h.MaxHealth <= 0 or h.Health <= 0 then return nil end
+        return h.Health / h.MaxHealth * 100
+    end
+    local function tpTo(pos)
+        local hrp = myRoot()
+        if not hrp then return end
+        hrp.CFrame = CFrame.new(pos)
+        hrp.AssemblyLinearVelocity = Vector3.zero
+    end
+    local function changeSlot(n)
+        local r = remote("ChangeSlot")
+        if r then pcall(function() r:InvokeServer(n) end) end
+    end
+    local function eat(slot)
+        local r = remote("ConsumeItem")
+        local inv = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("Inventory")
+        if r and inv then pcall(function() r:InvokeServer(inv, slot) end) end
+    end
+    local function blockCoords(ore)
+        local p = ore:GetPivot().Position / BLOCK_SIZE + GRID_OFFSET
+        return math.round(p.X), math.round(p.Y), math.round(p.Z)
+    end
+
+    local function cancelBlock()
+        local r = remote("CancelBlock")
+        if r then pcall(function() r:InvokeServer(nil, nil, nil) end) end
+    end
+
+    -- один цикл ломания: BreakBlock -> пауза -> AcceptBreakBlock
+    local function hitBlock(ore)
+        local br, ar = remote("BreakBlock"), remote("AcceptBreakBlock")
+        if not (br and ar) then return end
+        local x, y, z = blockCoords(ore)
+        if Farm.Debug then print("[Ore Farm] BreakBlock", ore.Name, x, y, z, "мир:", ore:GetPivot().Position) end
+        pcall(function() br:FireServer(x, y, z, nil) end)
+        if Farm.AcceptDelay > 0 then task.wait(Farm.AcceptDelay) end
+        local ok, res = pcall(function() return ar:InvokeServer() end)
+        if Farm.Debug then print("[Ore Farm] AcceptBreakBlock", ok, res) end
+    end
+
+    -- "наверх": точка на поверхности над текущим местом (луч сверху вниз)
+    local function surfacePos(hrp)
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = { LocalPlayer.Character }
+        local p = hrp.Position
+        local res = workspace:Raycast(Vector3.new(p.X, 2000, p.Z), Vector3.new(0, -4000, 0), params)
+        if res then return res.Position + Vector3.new(0, 4, 0) end
+        return p + Vector3.new(0, 80, 0)
+    end
+
+    local function healUp(my)
+        local hrp = myRoot()
+        if not hrp then return end
+        local pos = surfacePos(hrp)
+        local fails = 0
+        while Farm.Enabled and my == token do
+            local hp = hpPercent()
+            if not hp then return end
+            if hp >= Farm.HpFull then break end
+            tpTo(pos)
+            changeSlot(Farm.FoodSlot)
+            eat(Farm.FoodSlot)
+            task.wait(1.2)
+            local after = hpPercent() or hp
+            if after <= hp then
+                fails += 1
+                if fails >= 6 then
+                    Library:Notify("Нет еды или HP не растёт — фарм остановлен", 5)
+                    if farmModule then farmModule:Set(false) end
+                    return
+                end
+            else
+                fails = 0
+            end
+        end
+        changeSlot(Farm.PickSlot)
+    end
+
+    local function nearestOre()
+        local hrp = myRoot()
+        if not hrp then return end
+        local best, bestD
+        local now = os.clock()
+        for _, chunk in ipairs(Blocks:GetChildren()) do
+            for _, obj in ipairs(chunk:GetChildren()) do
+                if Farm.Ores[obj.Name] and (not skip[obj] or skip[obj] < now) and obj:IsA("PVInstance") then
+                    local d = (obj:GetPivot().Position - hrp.Position).Magnitude
+                    if not bestD or d < bestD then best, bestD = obj, d end
+                end
+            end
+        end
+        return best
+    end
+
+    local function mineOre(ore, my)
+        local hold = ore:GetPivot().Position + FARM_OFFSET
+        local name, start = ore.Name, os.clock()
+        while Farm.Enabled and my == token and ore:IsDescendantOf(workspace) and os.clock() - start < Farm.Timeout do
+            local hp = hpPercent()
+            if hp and hp < Farm.HpLow then return end  -- мало HP: главный цикл отправит лечиться
+            tpTo(hold)
+            hitBlock(ore)
+            task.wait(math.max(0.03, 1 / Farm.CPS - Farm.AcceptDelay))
+        end
+        if not ore:IsDescendantOf(workspace) then
+            record(name)
+        elseif Farm.Enabled and my == token then
+            skip[ore] = os.clock() + 60  -- не сломалась за таймаут: пропускаем на минуту
+            cancelBlock()
+        end
+    end
+
+    local function startFarm()
+        token += 1
+        local my = token
+        task.spawn(function()
+            changeSlot(Farm.PickSlot)
+            local lastIdle = 0
+            while Farm.Enabled and my == token do
+                if not myRoot() then
+                    task.wait(0.5)
+                    continue
+                end
+                local hp = hpPercent()
+                if hp and hp < Farm.HpLow then healUp(my) end
+                if not (Farm.Enabled and my == token) then break end
+                local ore = nearestOre()
+                if not ore then
+                    if os.clock() - lastIdle > 10 then
+                        lastIdle = os.clock()
+                        Library:Notify("Ore Farm: выбранных руд в загруженных чанках нет", 3)
+                    end
+                    task.wait(1)
+                else
+                    mineOre(ore, my)
+                end
+                task.wait()
+            end
+        end)
+    end
+
+    local prevUnload = Library.Unload
+    function Library:Unload()
+        Farm.Enabled = false
+        Guard.Force = false
+        token += 1
+        saveStats()
+        prevUnload(self)
+    end
+
+    --// ───────────── меню ─────────────
+    local Sec = FarmTab:AddSection("Ore Farm", "Left")
+    farmModule = Sec:AddModule({
+        Name = "Ore Farm",
+        Default = false,
+        Callback = function(state)
+            Farm.Enabled = state
+            Guard.Force = state           -- во время фарма удушье блокируется всегда
+            if state then
+                startFarm()
+            else
+                token += 1
+                cancelBlock()
+                flush()
+                saveStats()
+            end
+        end,
+    })
+    for _, name in ipairs(OreConfig.Order) do
+        farmModule:AddToggle({ Name = "Фармить: " .. labelOf(name), Default = Farm.Ores[name] or false,
+            Callback = function(v) Farm.Ores[name] = v end })
+    end
+    farmModule:AddSlider({ Name = "Ударов в секунду", Min = 1, Max = 20, Default = Farm.CPS, Increment = 1,
+        Callback = function(v) Farm.CPS = v end })
+    farmModule:AddSlider({ Name = "Пауза до Accept", Min = 0, Max = 2, Default = Farm.AcceptDelay, Increment = 0.05, Suffix = " с",
+        Callback = function(v) Farm.AcceptDelay = v end })
+    farmModule:AddSlider({ Name = "Таймаут руды", Min = 2, Max = 30, Default = Farm.Timeout, Increment = 1, Suffix = " с",
+        Callback = function(v) Farm.Timeout = v end })
+    farmModule:AddSlider({ Name = "Лечиться при HP ниже", Min = 10, Max = 90, Default = Farm.HpLow, Increment = 1, Suffix = "%",
+        Callback = function(v) Farm.HpLow = v end })
+    farmModule:AddSlider({ Name = "Есть до HP", Min = 50, Max = 100, Default = Farm.HpFull, Increment = 1, Suffix = "%",
+        Callback = function(v) Farm.HpFull = v end })
+    farmModule:AddSlider({ Name = "Слот кирки", Min = 0, Max = 8, Default = Farm.PickSlot, Increment = 1,
+        Callback = function(v) Farm.PickSlot = v end })
+    farmModule:AddSlider({ Name = "Слот еды", Min = 0, Max = 8, Default = Farm.FoodSlot, Increment = 1,
+        Callback = function(v) Farm.FoodSlot = v end })
+    farmModule:AddToggle({ Name = "Debug (print в консоль)", Default = false,
+        Callback = function(v) Farm.Debug = v end })
+
+    local Prot = FarmTab:AddSection("Защита", "Right")
+    Prot:AddModule({
+        Name = "No Suffocation",
+        Default = false,
+        Callback = function(state) Guard.Suffocation = state end,
+    })
+
+    local WSec = FarmTab:AddSection("Webhook", "Right")
+    WSec:AddTextbox({ Name = "Webhook URL", Flag = "Webhook.Url",
+        Placeholder = "Ссылка вебхука (для форума: ...?thread_id=ID)",
+        Callback = function(t) Web.Url = t end })
+    WSec:AddToggle({ Name = "Отправлять отчёты", Flag = "Webhook.Send", Default = true,
+        Callback = function(v) Web.Send = v end })
+    WSec:AddSlider({ Name = "Интервал отправки", Flag = "Webhook.Interval", Min = 10, Max = 600, Default = Web.Interval,
+        Increment = 5, Suffix = " с", Callback = function(v) Web.Interval = v end })
+    WSec:AddButton({ Name = "Тест вебхука", Callback = function()
+        task.spawn(function()
+            if post(buildEmbed("✅ Тест вебхука", {}, "Вебхук подключён, отчёты о добыче будут приходить сюда."), false) then
+                Library:Notify("Тест отправлен", 3)
+            end
+        end)
+    end })
+    WSec:AddButton({ Name = "Отправить отчёт сейчас", Callback = function()
+        task.spawn(function()
+            local snap = pending
+            if post(buildEmbed("⛏️ Ore Farm", snap), false) then
+                pending = {}
+                lastFlush = os.clock()
+                saveStats()
+                Library:Notify("Отчёт отправлен", 3)
+            end
+        end)
+    end })
 end
