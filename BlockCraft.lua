@@ -1691,25 +1691,29 @@ end
 
 --// ═══════════════════════════════════════════════════════════════════
 --// NO SUFFOCATION — блокируем отправку урона от удушья (GameRemotes.Demo)
+--// Хук ставится ТОЛЬКО когда ты сам включаешь модуль (не при запуске скрипта),
+--// и не через __namecall: игра кикает за него (Error 267, namecallInstance detector).
 --// ═══════════════════════════════════════════════════════════════════
-local Guard = { Suffocation = false, Force = false }
+local Guard = { Suffocation = false, Installed = false }
 
-do
+local function installSuffocationHook()
+    if Guard.Installed then return true end
     local ok = pcall(function()
-        assert(hookmetamethod and getnamecallmethod, "no hookmetamethod")
+        assert(hookfunction, "no hookfunction")
         local wrap = newcclosure or function(f) return f end
+        local probe = Instance.new("RemoteEvent")
         local old
-        old = hookmetamethod(game, "__namecall", wrap(function(self, ...)
-            if (Guard.Suffocation or Guard.Force) and getnamecallmethod() == "FireServer" then
+        old = hookfunction(probe.FireServer, wrap(function(self, ...)
+            if Guard.Suffocation and typeof(self) == "Instance" and self.Name == "Demo" then
                 local args = { ... }
-                if args[2] == "suffocation" and typeof(self) == "Instance" and self.Name == "Demo" then
-                    return  -- урон от удушья не отправляется
-                end
+                if args[2] == "suffocation" then return end  -- урон от удушья не отправляется
             end
             return old(self, ...)
         end))
+        probe:Destroy()
     end)
-    if not ok then print("[NurLib] hookmetamethod недоступен в этом экзекуторе: No Suffocation работать не будет") end
+    Guard.Installed = ok
+    return ok
 end
 
 --// ═══════════════════════════════════════════════════════════════════
@@ -1718,18 +1722,15 @@ end
 do
     local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
-    local FARM_OFFSET  = Vector3.new(0, BLOCK_SIZE, 0)  -- ◄◄ где стоять относительно руды (над ней)
-    -- Ломание блока: BreakBlock:FireServer(x, y, z, nil) -> AcceptBreakBlock:InvokeServer(); отмена: CancelBlock
-    -- x, y, z — координаты блока в сетке (мировая позиция / BLOCK_SIZE, округлено).
-    -- ◄◄ Если блоки не ломаются: включи Debug, сравни выведенные x,y,z с Cobalt для того же блока и поправь BLOCK_SIZE / GRID_OFFSET.
-    local GRID_OFFSET = Vector3.new(0, 0, 0)  -- ◄◄ сдвиг сетки, если координаты не совпадают
+    local FARM_OFFSET  = Vector3.new(0, BLOCK_SIZE, BLOCK_SIZE)  -- ◄◄ где стоять относительно руды (над ней и чуть сбоку)
+    -- Ломание: зажимаем ЛКМ и наводим камеру на руду, дальше игра сама отправляет BreakBlock/Accept.
 
     local ICONS = { CoalOre = "⚫", DiamondOre = "💎", GoldOre = "🟡", RubyOre = "🔴", SteelOre = "⚪", SapphireOre = "🔵" }
 
     local Farm = {
         Enabled = false,
         Ores = { DiamondOre = true, GoldOre = true, RubyOre = true, SapphireOre = true },
-        CPS = 8, AcceptDelay = 0.2, Timeout = 8, HpLow = 40, HpFull = 90, PickSlot = 0, FoodSlot = 2, Debug = false,
+        ClickMode = "VirtualInput", Timeout = 8, HpLow = 40, HpFull = 90, PickSlot = 0, FoodSlot = 2, Debug = false,
     }
     local Web = { Url = "", Send = true, Interval = 60 }
 
@@ -1886,26 +1887,33 @@ do
         local inv = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("Inventory")
         if r and inv then pcall(function() r:InvokeServer(inv, slot) end) end
     end
-    local function blockCoords(ore)
-        local p = ore:GetPivot().Position / BLOCK_SIZE + GRID_OFFSET
-        return math.round(p.X), math.round(p.Y), math.round(p.Z)
+    --// зажатие ЛКМ + наведение камеры на руду
+    local VIM = game:GetService("VirtualInputManager")
+    local AIM_BIND = "NurLib_FarmAim"
+    local holding, aimTarget = false, nil
+
+    local function lmb(down)
+        if down == holding then return end
+        holding = down
+        local cam = workspace.CurrentCamera
+        local vp = cam and cam.ViewportSize or Vector2.new(800, 600)
+        if Farm.ClickMode == "mouse1press" and mouse1press and mouse1release then
+            pcall(down and mouse1press or mouse1release)
+        else
+            pcall(function() VIM:SendMouseButtonEvent(vp.X / 2, vp.Y / 2, 0, down, game, 0) end)
+        end
     end
 
-    local function cancelBlock()
-        local r = remote("CancelBlock")
-        if r then pcall(function() r:InvokeServer(nil, nil, nil) end) end
+    local function aimStep()
+        if not aimTarget then return end
+        local cam = workspace.CurrentCamera
+        if cam then cam.CFrame = CFrame.lookAt(cam.CFrame.Position, aimTarget) end
     end
 
-    -- один цикл ломания: BreakBlock -> пауза -> AcceptBreakBlock
-    local function hitBlock(ore)
-        local br, ar = remote("BreakBlock"), remote("AcceptBreakBlock")
-        if not (br and ar) then return end
-        local x, y, z = blockCoords(ore)
-        if Farm.Debug then print("[Ore Farm] BreakBlock", ore.Name, x, y, z, "мир:", ore:GetPivot().Position) end
-        pcall(function() br:FireServer(x, y, z, nil) end)
-        if Farm.AcceptDelay > 0 then task.wait(Farm.AcceptDelay) end
-        local ok, res = pcall(function() return ar:InvokeServer() end)
-        if Farm.Debug then print("[Ore Farm] AcceptBreakBlock", ok, res) end
+    local function stopInput()
+        lmb(false)
+        aimTarget = nil
+        pcall(function() RunService:UnbindFromRenderStep(AIM_BIND) end)
     end
 
     -- "наверх": точка на поверхности над текущим местом (луч сверху вниз)
@@ -1964,26 +1972,36 @@ do
     end
 
     local function mineOre(ore, my)
-        local hold = ore:GetPivot().Position + FARM_OFFSET
+        local orePos = ore:GetPivot().Position
+        local hold = orePos + FARM_OFFSET
         local name, start = ore.Name, os.clock()
+        if Farm.Debug then print("[Ore Farm] ломаем", name, orePos) end
+
+        aimTarget = orePos
+        tpTo(hold)
+        task.wait(0.15)   -- даём камере и игре "увидеть" блок
+        lmb(true)         -- зажимаем ЛКМ
         while Farm.Enabled and my == token and ore:IsDescendantOf(workspace) and os.clock() - start < Farm.Timeout do
             local hp = hpPercent()
-            if hp and hp < Farm.HpLow then return end  -- мало HP: главный цикл отправит лечиться
+            if hp and hp < Farm.HpLow then break end  -- мало HP: главный цикл отправит лечиться
             tpTo(hold)
-            hitBlock(ore)
-            task.wait(math.max(0.03, 1 / Farm.CPS - Farm.AcceptDelay))
+            task.wait(0.1)
         end
+        lmb(false)        -- отпускаем ЛКМ
+        aimTarget = nil
+
         if not ore:IsDescendantOf(workspace) then
             record(name)
-        elseif Farm.Enabled and my == token then
+        elseif Farm.Enabled and my == token and os.clock() - start >= Farm.Timeout then
             skip[ore] = os.clock() + 60  -- не сломалась за таймаут: пропускаем на минуту
-            cancelBlock()
         end
     end
 
     local function startFarm()
         token += 1
         local my = token
+        pcall(function() RunService:UnbindFromRenderStep(AIM_BIND) end)
+        RunService:BindToRenderStep(AIM_BIND, Enum.RenderPriority.Camera.Value + 2, aimStep)
         task.spawn(function()
             changeSlot(Farm.PickSlot)
             local lastIdle = 0
@@ -2013,8 +2031,9 @@ do
     local prevUnload = Library.Unload
     function Library:Unload()
         Farm.Enabled = false
-        Guard.Force = false
+        Guard.Suffocation = false
         token += 1
+        stopInput()
         saveStats()
         prevUnload(self)
     end
@@ -2026,12 +2045,11 @@ do
         Default = false,
         Callback = function(state)
             Farm.Enabled = state
-            Guard.Force = state           -- во время фарма удушье блокируется всегда
             if state then
                 startFarm()
             else
                 token += 1
-                cancelBlock()
+                stopInput()
                 flush()
                 saveStats()
             end
@@ -2041,10 +2059,8 @@ do
         farmModule:AddToggle({ Name = "Фармить: " .. labelOf(name), Default = Farm.Ores[name] or false,
             Callback = function(v) Farm.Ores[name] = v end })
     end
-    farmModule:AddSlider({ Name = "Ударов в секунду", Min = 1, Max = 20, Default = Farm.CPS, Increment = 1,
-        Callback = function(v) Farm.CPS = v end })
-    farmModule:AddSlider({ Name = "Пауза до Accept", Min = 0, Max = 2, Default = Farm.AcceptDelay, Increment = 0.05, Suffix = " с",
-        Callback = function(v) Farm.AcceptDelay = v end })
+    farmModule:AddDropdown({ Name = "Метод клика", Options = { "VirtualInput", "mouse1press" }, Default = Farm.ClickMode,
+        Callback = function(v) Farm.ClickMode = v or "VirtualInput" end })
     farmModule:AddSlider({ Name = "Таймаут руды", Min = 2, Max = 30, Default = Farm.Timeout, Increment = 1, Suffix = " с",
         Callback = function(v) Farm.Timeout = v end })
     farmModule:AddSlider({ Name = "Лечиться при HP ниже", Min = 10, Max = 90, Default = Farm.HpLow, Increment = 1, Suffix = "%",
@@ -2059,10 +2075,22 @@ do
         Callback = function(v) Farm.Debug = v end })
 
     local Prot = FarmTab:AddSection("Защита", "Right")
-    Prot:AddModule({
+    local sufMod
+    sufMod = Prot:AddModule({
         Name = "No Suffocation",
         Default = false,
-        Callback = function(state) Guard.Suffocation = state end,
+        Callback = function(state)
+            if state then
+                if not installSuffocationHook() then
+                    Library:Notify("No Suffocation не включён: экзекутор не поддерживает hookfunction", 5)
+                    Guard.Suffocation = false
+                    sufMod:Set(false, true)
+                    return
+                end
+                Library:Notify("No Suffocation использует хук. Если игра кикнет — не включай его", 6)
+            end
+            Guard.Suffocation = state
+        end,
     })
 
     local WSec = FarmTab:AddSection("Webhook", "Right")
