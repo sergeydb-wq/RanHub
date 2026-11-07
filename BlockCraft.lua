@@ -359,18 +359,36 @@ end
 local function BuildTextbox(parent, o)
     local obj = { Value = "" }
     local flag = o.Flag or o.Name
+    local focused = false
     local row = New("Frame", { Size = UDim2.new(1, 0, 0, 34), BackgroundTransparency = 1, Parent = parent })
     local box = New("TextBox", { Position = UDim2.fromOffset(12, 3), Size = UDim2.new(1, -24, 0, 28),
         BackgroundColor3 = Theme.Field, Text = "", PlaceholderText = o.Placeholder or o.Name,
         PlaceholderColor3 = Theme.SubText, Font = Enum.Font.GothamMedium, TextSize = 13,
-        TextColor3 = Theme.Text, ClearTextOnFocus = false, Parent = row }, { Corner(6), Pad(8, 0, 8, 0) })
+        TextColor3 = Theme.Text, ClearTextOnFocus = false, ClipsDescendants = true,
+        TextXAlignment = Enum.TextXAlignment.Left, TextWrapped = false, Parent = row }, { Corner(6), Pad(8, 0, 8, 0) })
+
+    -- o.Secret: когда поле не в фокусе, вместо текста показываются точки (сама ссылка не светится в меню)
+    local function shown(t)
+        if o.Secret and not focused and #t > 0 then return string.rep("•", math.min(#t, 24)) end
+        return t
+    end
     local function commit(t, silent)
         obj.Value = t
         if not o.NoFlag then Library.Flags[flag] = t end
         if not silent and o.Callback then task.spawn(o.Callback, t) end
     end
-    box.FocusLost:Connect(function() commit(box.Text) end)
-    function obj:Set(t, silent) t = tostring(t or ""); box.Text = t; commit(t, silent) end
+    box.Focused:Connect(function() focused = true; box.Text = obj.Value end)
+    box.FocusLost:Connect(function()
+        local t = box.Text
+        focused = false
+        commit(t)
+        box.Text = shown(t)
+    end)
+    function obj:Set(t, silent)
+        t = tostring(t or "")
+        commit(t, silent)
+        box.Text = shown(t)
+    end
     if not o.NoFlag then Library.Setters[flag] = function(v) obj:Set(v) end end
     if o.Default then obj:Set(o.Default, true) end
     return obj
@@ -1223,10 +1241,98 @@ do
 end
 
 --// ═══════════════════════════════════════════════════════════════════
+--// БРОНЯ: поиск, рейтинг и цвета (используют Player ESP и вкладка "Движение")
+--// Порядок от лучшей к худшей: sapphire > diamond > ruby > gold > steel > stone
+--// ═══════════════════════════════════════════════════════════════════
+local Armor = {}
+do
+    local RANK = { sapphire = 6, diamond = 5, ruby = 4, gold = 3, steel = 2, stone = 1 }
+    local COLORS = {
+        sapphire = Color3.fromRGB(40, 110, 255),    -- синий
+        diamond  = Color3.fromRGB(0, 230, 255),     -- голубой
+        ruby     = Color3.fromRGB(255, 50, 50),     -- красный
+        gold     = Color3.fromRGB(255, 215, 0),     -- жёлтый
+        steel    = Color3.fromRGB(170, 170, 170),   -- серый
+        stone    = Color3.fromRGB(85, 85, 85),      -- светло-чёрный
+    }
+    local MATERIALS = { "sapphire", "diamond", "ruby", "gold", "steel", "stone", "iron", "coal",
+        "leather", "wood", "copper", "silver", "emerald", "netherite", "chainmail" }
+    local SLOTS = {
+        { key = "helmet",     words = { "helmet", "helm" } },
+        { key = "chestplate", words = { "chestplate", "chest" } },
+        { key = "leggings",   words = { "leggings", "leggins", "leggens", "legs" } },
+        { key = "boots",      words = { "boots", "boot" } },
+    }
+
+    local function matchArmor(str, found)
+        local l = string.lower(str)
+        for _, slot in ipairs(SLOTS) do
+            if not found[slot.key] then
+                for _, w in ipairs(slot.words) do
+                    if l:find(w, 1, true) then
+                        for _, m in ipairs(MATERIALS) do
+                            if l:find(m, 1, true) then found[slot.key] = m break end
+                        end
+                        break
+                    end
+                end
+            end
+        end
+    end
+
+    -- found = { helmet = "diamond", boots = "steel", ... }
+    function Armor.scan(char)
+        local found = {}
+        for _, d in ipairs(char:GetDescendants()) do
+            matchArmor(d.Name, found)
+            local par = d.Parent
+            if par and par ~= char then matchArmor(par.Name .. " " .. d.Name, found) end
+            if d:IsA("StringValue") then matchArmor(d.Value, found) end
+        end
+        for k, v in pairs(char:GetAttributes()) do
+            matchArmor(tostring(k), found)
+            if type(v) == "string" then matchArmor(v, found) end
+        end
+        return found
+    end
+
+    function Armor.pieces(found)
+        local out = {}
+        for _, slot in ipairs(SLOTS) do
+            if found[slot.key] then table.insert(out, { mat = found[slot.key], slot = slot.key }) end
+        end
+        return out
+    end
+
+    -- строка с цветными (RichText) частями брони
+    function Armor.rich(found)
+        local out = {}
+        for _, pc in ipairs(Armor.pieces(found)) do
+            local c = COLORS[pc.mat] or Color3.new(1, 1, 1)
+            table.insert(out, string.format('<font color="#%s">%s %s</font>', c:ToHex(), pc.mat, pc.slot))
+        end
+        return table.concat(out, " | ")
+    end
+
+    -- рейтинг: сумма очков частей (sapphire 6 ... stone 1), при равенстве выше тот, у кого лучшая часть
+    function Armor.score(found)
+        local sum, best = 0, 0
+        for _, pc in ipairs(Armor.pieces(found)) do
+            local r = RANK[pc.mat] or 0.5
+            sum += r
+            best = math.max(best, r)
+        end
+        return sum * 10 + best
+    end
+
+    function Armor.points(score) return math.floor(score / 10) end
+end
+
+--// ═══════════════════════════════════════════════════════════════════
 --// PLAYER ESP (подсветка + имя; друзья — зелёным)
 --// ═══════════════════════════════════════════════════════════════════
 do
-    local PESP = { Enabled = false, Transparency = 0.5, ShowDistance = true, Color = Color3.fromRGB(255, 50, 50) }
+    local PESP = { Enabled = false, Transparency = 0.5, ShowDistance = true, ShowArmor = true, Color = Theme.Accent }
     local entries = {}  -- [player] = { char, hl, gui, label }
 
     local function clearEntry(p)
@@ -1247,7 +1353,7 @@ do
         local gui = Instance.new("BillboardGui")
         gui.Adornee = hrp
         gui.AlwaysOnTop = true
-        gui.Size = UDim2.fromOffset(220, 20)
+        gui.Size = UDim2.fromOffset(420, 36)
         gui.StudsOffset = Vector3.new(0, 3.5, 0)
         gui.Parent = hrp
 
@@ -1256,6 +1362,9 @@ do
         label.Size = UDim2.fromScale(1, 1)
         label.Font = Enum.Font.GothamBold
         label.TextSize = 14
+        label.TextWrapped = false
+        label.RichText = true
+        label.TextYAlignment = Enum.TextYAlignment.Bottom
         label.TextStrokeTransparency = 0.4
         label.Parent = gui
 
@@ -1285,12 +1394,21 @@ do
                     e.hl.OutlineColor = color
                     e.hl.FillTransparency = PESP.Transparency
                     e.label.TextColor3 = color
+                    local text = p.Name
                     if PESP.ShowDistance and myHrp then
                         local blocks = math.floor((hrp.Position - myHrp.Position).Magnitude / BLOCK_SIZE + 0.5)
-                        e.label.Text = string.format("%s [%d бл]", p.Name, blocks)
-                    else
-                        e.label.Text = p.Name
+                        text = string.format("%s [%d бл]", p.Name, blocks)
                     end
+                    text = string.format('<font color="#%s">%s</font>', color:ToHex(), text)  -- ник: цвет клиента (друг: зелёный)
+                    if PESP.ShowArmor then
+                        local now = os.clock()
+                        if not e.armorAt or now - e.armorAt > 2 then  -- броню пересканируем раз в 2 сек
+                            e.armorAt = now
+                            e.armor = Armor.rich(Armor.scan(char))
+                        end
+                        if e.armor and e.armor ~= "" then text = text .. "\n" .. e.armor end
+                    end
+                    e.label.Text = text
                 end
             end
         end
@@ -1311,7 +1429,35 @@ do
         prevUnload(self)
     end
 
-    local rgb = { r = 255, g = 50, b = 50 }
+    local function dumpNearest()
+        local myHrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+        local best, bestD
+        for _, p in ipairs(Players:GetPlayers()) do
+            local h = p ~= LocalPlayer and p.Character and p.Character:FindFirstChild("HumanoidRootPart")
+            if h and myHrp then
+                local d = (h.Position - myHrp.Position).Magnitude
+                if not bestD or d < bestD then best, bestD = p, d end
+            end
+        end
+        if not best then Library:Notify("Рядом нет игроков", 3) return end
+        local out = { "== " .. best.Name .. " ==" }
+        for k, v in pairs(best.Character:GetAttributes()) do table.insert(out, "ATTR " .. tostring(k) .. " = " .. tostring(v)) end
+        for i, d in ipairs(best.Character:GetDescendants()) do
+            if i > 400 then table.insert(out, "...") break end
+            local extra = d:IsA("StringValue") and (" = " .. d.Value) or ""
+            table.insert(out, d.ClassName .. " " .. d:GetFullName() .. extra)
+        end
+        local text = table.concat(out, "\n")
+        print(text)
+        if setclipboard then pcall(setclipboard, text) end
+        Library:Notify("Дамп " .. best.Name .. " в консоли" .. (setclipboard and " и в буфере" or ""), 4)
+    end
+
+    local rgb = {
+        r = math.floor(Theme.Accent.R * 255 + 0.5),
+        g = math.floor(Theme.Accent.G * 255 + 0.5),
+        b = math.floor(Theme.Accent.B * 255 + 0.5),
+    }
     local function applyColor() PESP.Color = Color3.fromRGB(rgb.r, rgb.g, rgb.b) end
 
     local Sec = Visuals:AddSection("Игроки", "Left")
@@ -1327,6 +1473,9 @@ do
         Callback = function(v) PESP.Transparency = v end })
     m:AddToggle({ Name = "Показывать расстояние", Default = true,
         Callback = function(v) PESP.ShowDistance = v end })
+    m:AddToggle({ Name = "Показывать броню", Default = true,
+        Callback = function(v) PESP.ShowArmor = v; for _, e in pairs(entries) do e.armorAt = nil end end })
+    Sec:AddButton({ Name = "Дамп брони ближайшего игрока", Callback = dumpNearest })
     m:AddSlider({ Name = "Враги R", Min = 0, Max = 255, Default = rgb.r, Increment = 1,
         Callback = function(v) rgb.r = v; applyColor() end })
     m:AddSlider({ Name = "Враги G", Min = 0, Max = 255, Default = rgb.g, Increment = 1,
@@ -1722,7 +1871,7 @@ end
 do
     local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
-    local FARM_OFFSET  = Vector3.new(0, BLOCK_SIZE, BLOCK_SIZE)  -- ◄◄ где стоять относительно руды (над ней и чуть сбоку)
+    local HEAD_OFFSET  = 1.5  -- ◄◄ на сколько стадов HumanoidRootPart ниже головы: голова окажется в центре руды
     -- Ломание: зажимаем ЛКМ и наводим камеру на руду, дальше игра сама отправляет BreakBlock/Accept.
 
     local ICONS = { CoalOre = "⚫", DiamondOre = "💎", GoldOre = "🟡", RubyOre = "🔴", SteelOre = "⚪", SapphireOre = "🔵" }
@@ -1875,7 +2024,7 @@ do
     local function tpTo(pos)
         local hrp = myRoot()
         if not hrp then return end
-        hrp.CFrame = CFrame.new(pos)
+        hrp.CFrame = CFrame.new(pos) * (hrp.CFrame - hrp.CFrame.Position)  -- позиция новая, поворот прежний
         hrp.AssemblyLinearVelocity = Vector3.zero
     end
     local function changeSlot(n)
@@ -1887,10 +2036,9 @@ do
         local inv = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("Inventory")
         if r and inv then pcall(function() r:InvokeServer(inv, slot) end) end
     end
-    --// зажатие ЛКМ + наведение камеры на руду
+    --// зажатие ЛКМ
     local VIM = game:GetService("VirtualInputManager")
-    local AIM_BIND = "NurLib_FarmAim"
-    local holding, aimTarget = false, nil
+    local holding = false
 
     local function lmb(down)
         if down == holding then return end
@@ -1904,17 +2052,7 @@ do
         end
     end
 
-    local function aimStep()
-        if not aimTarget then return end
-        local cam = workspace.CurrentCamera
-        if cam then cam.CFrame = CFrame.lookAt(cam.CFrame.Position, aimTarget) end
-    end
-
-    local function stopInput()
-        lmb(false)
-        aimTarget = nil
-        pcall(function() RunService:UnbindFromRenderStep(AIM_BIND) end)
-    end
+    local function stopInput() lmb(false) end
 
     -- "наверх": точка на поверхности над текущим местом (луч сверху вниз)
     local function surfacePos(hrp)
@@ -1973,13 +2111,12 @@ do
 
     local function mineOre(ore, my)
         local orePos = ore:GetPivot().Position
-        local hold = orePos + FARM_OFFSET
+        local hold = orePos - Vector3.new(0, HEAD_OFFSET, 0)  -- голова в центре руды
         local name, start = ore.Name, os.clock()
         if Farm.Debug then print("[Ore Farm] ломаем", name, orePos) end
 
-        aimTarget = orePos
         tpTo(hold)
-        task.wait(0.15)   -- даём камере и игре "увидеть" блок
+        task.wait(0.15)   -- даём игре "увидеть" блок перед головой
         lmb(true)         -- зажимаем ЛКМ
         while Farm.Enabled and my == token and ore:IsDescendantOf(workspace) and os.clock() - start < Farm.Timeout do
             local hp = hpPercent()
@@ -1988,7 +2125,6 @@ do
             task.wait(0.1)
         end
         lmb(false)        -- отпускаем ЛКМ
-        aimTarget = nil
 
         if not ore:IsDescendantOf(workspace) then
             record(name)
@@ -2000,8 +2136,9 @@ do
     local function startFarm()
         token += 1
         local my = token
-        pcall(function() RunService:UnbindFromRenderStep(AIM_BIND) end)
-        RunService:BindToRenderStep(AIM_BIND, Enum.RenderPriority.Camera.Value + 2, aimStep)
+        if not Guard.Suffocation then
+            Library:Notify("Голова будет в руде: включи No Suffocation, иначе будет урон от удушья", 6)
+        end
         task.spawn(function()
             changeSlot(Farm.PickSlot)
             local lastIdle = 0
@@ -2094,7 +2231,7 @@ do
     })
 
     local WSec = FarmTab:AddSection("Webhook", "Right")
-    WSec:AddTextbox({ Name = "Webhook URL", Flag = "Webhook.Url",
+    WSec:AddTextbox({ Name = "Webhook URL", Flag = "Webhook.Url", Secret = true,
         Placeholder = "Ссылка вебхука (для форума: ...?thread_id=ID)",
         Callback = function(t) Web.Url = t end })
     WSec:AddToggle({ Name = "Отправлять отчёты", Flag = "Webhook.Send", Default = true,
@@ -2119,4 +2256,98 @@ do
             end
         end)
     end })
+end
+
+--// ═══════════════════════════════════════════════════════════════════
+--// ТОП БРОНИ + ТЕЛЕПОРТ К ЛУЧШЕЙ БРОНЕ (вкладка "Движение")
+--// ═══════════════════════════════════════════════════════════════════
+do
+    local ROWS, ROW_H = 8, 42
+    local topList = {}
+
+    local function tpToPlayer(p)
+        local tHrp = p.Character and p.Character:FindFirstChild("HumanoidRootPart")
+        local myHrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+        if not (tHrp and myHrp) then Library:Notify("Игрок или твой персонаж недоступен", 3) return false end
+        myHrp.CFrame = tHrp.CFrame * CFrame.new(0, 0, 3)  -- на 3 стада позади цели
+        return true
+    end
+
+    local Sec = Movement:AddSection("Броня", "Right")
+
+    -- контейнер со строками топа (каждая строка — кнопка: клик = телепорт к игроку)
+    local container = New("Frame", { Size = UDim2.new(1, 0, 0, 0), BackgroundTransparency = 1 })
+    local rows = {}
+
+    local function refreshTop()
+        local myHrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+        local list = {}
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p ~= LocalPlayer and p.Character then
+                local found = Armor.scan(p.Character)
+                local score = Armor.score(found)
+                if score > 0 then
+                    local h = p.Character:FindFirstChild("HumanoidRootPart")
+                    local d = (h and myHrp) and (h.Position - myHrp.Position).Magnitude or math.huge
+                    table.insert(list, { player = p, found = found, score = score, dist = d })
+                end
+            end
+        end
+        table.sort(list, function(a, b)
+            if a.score ~= b.score then return a.score > b.score end
+            return a.dist < b.dist
+        end)
+        topList = list
+
+        local n = math.min(#list, ROWS)
+        for i = 1, ROWS do
+            local row, e = rows[i], list[i]
+            if e and i <= ROWS then
+                row.player = e.player
+                row.btn.Visible = true
+                local nameColor = isFriend(e.player) and FRIEND_COLOR or Theme.Text
+                row.lbl.Text = string.format('<font color="#%s"><b>%d. %s</b></font>  [%d]\n%s',
+                    nameColor:ToHex(), i, e.player.Name, Armor.points(e.score), Armor.rich(e.found))
+            else
+                row.player = nil
+                row.btn.Visible = false
+            end
+        end
+        container.Size = UDim2.new(1, 0, 0, n * ROW_H)
+    end
+
+    for i = 1, ROWS do
+        local btn = New("TextButton", {
+            Position = UDim2.new(0, 12, 0, (i - 1) * ROW_H), Size = UDim2.new(1, -24, 0, ROW_H - 4),
+            BackgroundColor3 = Theme.Field, Text = "", AutoButtonColor = false, Visible = false, Parent = container,
+        }, { Corner(6) })
+        local lbl = New("TextLabel", {
+            Position = UDim2.fromOffset(8, 0), Size = UDim2.new(1, -16, 1, 0), BackgroundTransparency = 1,
+            RichText = true, Font = Enum.Font.GothamMedium, TextSize = 12, TextColor3 = Theme.Text,
+            TextXAlignment = Enum.TextXAlignment.Left, TextWrapped = false, Text = "", Parent = btn,
+        })
+        rows[i] = { btn = btn, lbl = lbl }
+        btn.MouseButton1Click:Connect(function()
+            local pl = rows[i].player
+            if pl and tpToPlayer(pl) then Library:Notify("Телепорт к " .. pl.Name, 2) end
+        end)
+    end
+
+    Sec:AddButton({ Name = "Телепорт к лучшей броне", Callback = function()
+        refreshTop()
+        local best = topList[1]
+        if not best then Library:Notify("Игроков с бронёй не найдено", 3) return end
+        if tpToPlayer(best.player) then Library:Notify("Телепорт к " .. best.player.Name, 3) end
+    end })
+    Sec:AddButton({ Name = "Обновить топ", Callback = refreshTop })
+    container.Parent = Sec.Body   -- список идёт после кнопок
+
+    local last = 0
+    table.insert(conns, RunService.Heartbeat:Connect(function()
+        local now = os.clock()
+        if now - last < 3 then return end
+        last = now
+        refreshTop()
+    end))
+    refreshTop()
 end
